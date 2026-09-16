@@ -162,7 +162,12 @@ type ChatMeta struct {
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
 // meta 为会话头族元数据（纯新增，不改既有头），见 injectConversationHeaders。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
-	c.CommonHeaders(req, a)
+	// global 复用国内反代指纹；国际版只改目标 host 与 X-Domain。
+	commonAuth := a
+	if a != nil && a.IsGlobal() {
+		commonAuth = nil
+	}
+	c.CommonHeaders(req, commonAuth)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if a.AccessToken != "" {

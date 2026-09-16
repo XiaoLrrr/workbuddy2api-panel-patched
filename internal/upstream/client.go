@@ -447,22 +447,8 @@ func (c *Client) globalOn(a *auth.Auth) bool {
 	return c.GlobalEnabled && a != nil && a.Realm() == "global"
 }
 
-// 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
-const (
-	chatCompletionsPath   = "/v2/chat/completions"
-	globalChatConsolePath = "/console/chat/completions"
-)
-
-// chatPaths 按 realm 返回 chat 端点路径候选序列：
-// global → [console, v2]（404/405 时 fallback）；cn → [v2]（现状逐字，零回归）。
-func (c *Client) chatPaths(a *auth.Auth) []string {
-	if c.globalOn(a) {
-		return []string{globalChatConsolePath, chatCompletionsPath}
-	}
-	return []string{chatCompletionsPath}
-}
-
-func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
+// 国内反代与国际版共用同一聊天路径；global 只切 host 与 X-Domain。
+const chatCompletionsPath = "/v2/chat/completions"
 
 // billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
 // 统一走 billingJSON 发请求。
@@ -684,8 +670,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 需要客户端断开联动的调用方用 ChatStreamContext 传入请求 ctx。
 //
-// global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
-// （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
+// global 与 cn 共用国内反代请求形状，仅 host 与 X-Domain 不同。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
 }
@@ -694,55 +679,40 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // handler 传 r.Context() → 客户端断开时上游请求随之取消（不再白白消耗账号积分
 // 与上游连接继续生成无人消费的流）。成功流的 cancel 仍由 monitorBody 的 Close
 // 接管（reqCtx 取消与显式 Close 任一触发即断）。
-// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
-// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var cancel context.CancelFunc
-	// global 首次路径 404/405 时换 fallback 路径重试。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
-	if c.globalOn(a) {
-		prepared = ensureConsoleSystem(prepared)
+	endpoint := c.chatBase(a) + chatCompletionsPath
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
+	if err != nil {
+		return nil, 0, nil, err
 	}
-	for attempt, path := range c.chatPaths(a) {
-		endpoint := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
-		if err != nil {
-			return nil, 0, nil, err
-		}
-		c.ChatHeaders(req, a, clientIP, meta)
-		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
-		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
-		reqCtx, cancel := context.WithCancel(ctx)
-		req = req.WithContext(reqCtx)
-		resp, err := c.chatHTTP().Do(req)
-		if err != nil {
-			cancel()
-			log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
-			return nil, 0, nil, err
-		}
-		if resp.StatusCode >= 400 {
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			resp.Body.Close()
-			cancel()
-			kind := Classify(resp.StatusCode, string(raw))
-			log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
-				a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
-			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
-			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
-				continue
-			}
-			return nil, resp.StatusCode, raw, nil
-		}
-		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
-		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
-		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+	c.ChatHeaders(req, a, clientIP, meta)
+	// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
+	// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
+	reqCtx, cancel := context.WithCancel(ctx)
+	req = req.WithContext(reqCtx)
+	resp, err := c.chatHTTP().Do(req)
+	if err != nil {
+		cancel()
+		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
+		return nil, 0, nil, err
 	}
-	cancel()
-	return nil, 0, nil, nil
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		cancel()
+		kind := Classify(resp.StatusCode, string(raw))
+		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
+			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		return nil, resp.StatusCode, raw, nil
+	}
+	// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
+	// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
+	// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
+	return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。

@@ -468,6 +468,45 @@ func TestChatStreamRoutesToChatHTTP(t *testing.T) {
 	}
 }
 
+func TestGlobalChatReusesCNRequestShape(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	c := testClient(nil)
+	c.GlobalEnabled = true
+	c.ChatBaseGlobal = "https://www.workbuddy.ai"
+	c.ChatHTTP = &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.String() != "https://www.workbuddy.ai/v2/chat/completions" {
+			t.Errorf("url=%q", r.URL)
+		}
+		if got := r.Header.Get("X-Domain"); got != "www.workbuddy.ai" {
+			t.Errorf("X-Domain=%q", got)
+		}
+		if got := r.Header.Get("Origin"); got != originRefererCN {
+			t.Errorf("Origin=%q want CN shape", got)
+		}
+		if got := r.Header.Get("Accept-Language"); got != "zh-CN" {
+			t.Errorf("Accept-Language=%q want CN shape", got)
+		}
+		if strings.Contains(r.Header.Get("User-Agent"), "WorkBuddy AI") {
+			t.Errorf("User-Agent=%q want CN shape", r.Header.Get("User-Agent"))
+		}
+		raw, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(raw), "You are a helpful assistant.") {
+			t.Errorf("global body still contains console-only system injection: %s", raw)
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
+	})}
+	a := &auth.Auth{AccessToken: "at", UID: "u1", Domain: "www.workbuddy.ai"}
+	rc, status, _, err := c.ChatStream(a, []byte(`{"messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	rc.Close()
+}
+
 func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 	c := testClient(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
