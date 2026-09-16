@@ -1,0 +1,43 @@
+name: Release patched build
+
+on:
+  push:
+    tags:
+      - 'v*-patched.*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to build and release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/wb2api-linux-amd64 ./cmd/server
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/wb2api-windows-amd64.exe ./cmd/server
+          tar -C dist -czf dist/wb2api-linux-amd64.tar.gz wb2api-linux-amd64
+          (cd dist && zip -q wb2api-windows-amd64.zip wb2api-windows-amd64.exe)
+          rm dist/wb2api-linux-amd64 dist/wb2api-windows-amd64.exe
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          gh release view "${RELEASE_TAG}" >/dev/null 2>&1 || gh release create "${RELEASE_TAG}" --verify-tag --generate-notes --title "${RELEASE_TAG}"
+          gh release upload "${RELEASE_TAG}" dist/* --clobber
